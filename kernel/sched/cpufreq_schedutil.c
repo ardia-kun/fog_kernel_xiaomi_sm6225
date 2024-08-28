@@ -66,13 +66,12 @@ struct sugov_cpu {
 
 	struct sched_walt_cpu_load walt_load;
 
-	unsigned long		util;
-	unsigned long		bw_min;
+	unsigned long util;
+	unsigned int flags;
 
-	/* The field below is for single-CPU policies only: */
-#ifdef CONFIG_NO_HZ_COMMON
-	unsigned long		saved_idle_calls;
-#endif
+	unsigned long		bw_dl;
+	unsigned long		min;
+	unsigned long		max;
 };
 
 static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
@@ -543,18 +542,44 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 	return (sg_cpu->iowait_boost * max_cap) >> SCHED_CAPACITY_SHIFT;
 }
 
-#ifdef CONFIG_NO_HZ_COMMON
-static bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu)
+#define NL_RATIO 75
+#define DEFAULT_HISPEED_LOAD 90
+#define DEFAULT_CPU0_RTG_BOOST_FREQ 1000000
+#define DEFAULT_CPU4_RTG_BOOST_FREQ 0
+#define DEFAULT_CPU7_RTG_BOOST_FREQ 0
+static void sugov_walt_adjust(struct sugov_cpu *sg_cpu, unsigned long *util,
+			      unsigned long *max)
 {
-	unsigned long idle_calls = tick_nohz_get_idle_calls_cpu(sg_cpu->cpu);
-	bool ret = idle_calls == sg_cpu->saved_idle_calls;
+	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+	bool is_migration = sg_cpu->flags & SCHED_CPUFREQ_INTERCLUSTER_MIG;
+	bool is_rtg_boost = sg_cpu->walt_load.rtgb_active;
+	unsigned long nl = sg_cpu->walt_load.nl;
+	unsigned long cpu_util = sg_cpu->util;
+	bool is_hiload;
+	unsigned long pl = sg_cpu->walt_load.pl;
 
-	sg_cpu->saved_idle_calls = idle_calls;
-	return ret;
+	if (use_pelt())
+		return;
+
+	if (is_rtg_boost)
+		*util = max(*util, sg_policy->rtg_boost_util);
+
+	is_hiload = (cpu_util >= mult_frac(sg_policy->avg_cap,
+					   sg_policy->tunables->hispeed_load,
+					   100));
+
+	if (is_hiload && !is_migration)
+		*util = max(*util, sg_policy->hispeed_util);
+
+	if (is_hiload && nl >= mult_frac(cpu_util, NL_RATIO, 100))
+		*util = *max;
+
+	if (sg_policy->tunables->pl) {
+		if (conservative_pl())
+			pl = mult_frac(pl, TARGET_LOAD, 100);
+		*util = max(*util, pl);
+	}
 }
-#else
-static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
-#endif /* CONFIG_NO_HZ_COMMON */
 
 /*
  * Make sugov_should_update_freq() ignore the rate limit when DL
@@ -573,8 +598,6 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned long max_cap;
 	unsigned int next_f;
-	bool busy;
-        unsigned long boost;
 
 	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
 
@@ -586,24 +609,32 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	if (!sugov_should_update_freq(sg_policy, time))
 		return;
 
-	/* Limits may have changed, don't skip frequency update */
-	busy = use_pelt() && !sg_policy->need_freq_update &&
-		sugov_cpu_is_busy(sg_cpu);
+	sg_cpu->util = util = sugov_get_util(sg_cpu);
+	max = sg_cpu->max;
+	sg_cpu->flags = flags;
 
-	boost = sugov_iowait_apply(sg_cpu, time, max_cap);
-	sugov_get_util(sg_cpu, boost);
+	if (sg_policy->max != max) {
+		sg_policy->max = max;
+		hs_util = target_util(sg_policy,
+				       sg_policy->tunables->hispeed_freq);
+		sg_policy->hispeed_util = hs_util;
 
-	next_f = get_next_freq(sg_policy, sg_cpu->util, max_cap);
-	/*
-	 * Do not reduce the frequency if the CPU has not been idle
-	 * recently, as the reduction is likely to be premature then.
-	 */
-	if (busy && next_f < sg_policy->next_freq) {
-		next_f = sg_policy->next_freq;
-
-		/* Restore cached freq as next_freq has changed */
-		sg_policy->cached_raw_freq = sg_policy->prev_cached_raw_freq;
+		boost_util = target_util(sg_policy,
+				    sg_policy->tunables->rtg_boost_freq);
+		sg_policy->rtg_boost_util = boost_util;
 	}
+
+	util = sugov_iowait_apply(sg_cpu, time, util, max);
+	sugov_calc_avg_cap(sg_policy, sg_cpu->walt_load.ws,
+			   sg_policy->policy->cur);
+
+	trace_sugov_util_update(sg_cpu->cpu, sg_cpu->util,
+				sg_policy->avg_cap, max, sg_cpu->walt_load.nl,
+				sg_cpu->walt_load.pl,
+				sg_cpu->walt_load.rtgb_active, flags);
+
+	sugov_walt_adjust(sg_cpu, &util, &max);
+	next_f = get_next_freq(sg_policy, util, max);
 
 	/*
 	 * This code runs under rq->lock for the target CPU, so it won't run
